@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
 # Usage:
-#   chmod +x check_setup.sh        
-#   sudo ./check_setup.sh --auto  
+#   chmod +x setup.sh        
+#   sudo ./setup.sh --auto  
 
 set +e  # keep checking even after individual failures
 
@@ -25,7 +25,7 @@ info() { printf "         %s\n" "$1"; }
 section() { printf "\n${BOLD}%s${RESET}\n" "$1"; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_FILE="$SCRIPT_DIR/main.py"
+PROJECT_FILE="$SCRIPT_DIR/run.py"
 
 # ---- argument parsing ----------------------------------------------------
 #
