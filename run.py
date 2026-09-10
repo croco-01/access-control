@@ -14,22 +14,10 @@ from mfrc522 import SimpleMFRC522
 import adafruit_fingerprint
 from RPLCD.gpio import CharLCD
 
-VERSION = "1.5"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_FILE = os.path.join(BASE_DIR, "fingerprint_database.json")
 DB_BACKUP = DB_FILE + ".bak"
 SECURITY_LOG = os.path.join(BASE_DIR, "access_log.jsonl")
-
-REQUIRE_ALL_HARDWARE = True
-HARDWARE_RETRY_SECONDS = 5
-
-# ---------------------------------------------------------- access rules --
-#
-# Regular (non-admin) users can optionally be restricted to specific
-# hours of the day. Format: {"start": "HH:MM", "end": "HH:MM"}, 24h clock.
-# An entry of None (default) means "no restriction, any time." Admins
-# (the master RFID holder) are never subject to a schedule.
-DEFAULT_SCHEDULE = None  # e.g. {"start": "09:00", "end": "18:00"}
 
 # Persistent lockout: failed-attempt state survives a restart, and the
 # cooldown grows with repeated lockouts instead of resetting every time
@@ -53,38 +41,18 @@ MAX_FINGERPRINT_ATTEMPTS = 3
 LOCKOUT_THRESHOLD = 3       # consecutive denied attempts before lockout
 LOCKOUT_SECONDS = 10
 
-BUZZER_PIN = 12                 # BOARD (physical) pin numbering, to match
-                                 # the mfrc522 library, which forces
-                                 # GPIO.setmode(GPIO.BOARD) internally.
-                                 # Change to match your wiring.
-BUZZER_ACTIVE_HIGH = True       # False if using an active-low buzzer/relay module
-BUZZER_TONE_HZ = 2000           # PWM frequency driving the buzzer. Works for
-                                 # both types: a passive buzzer needs this
-                                 # tone to make sound at all; an active
-                                 # buzzer has its own oscillator and just
-                                 # buzzes on any signal, ignoring the tone.
-GRANTED_BUZZ_SECONDS = 0.3
-DENIED_BUZZ_SECONDS = 5.0
-# Distinct SOS-like pattern (3 short, 3 long, 3 short) used ONLY to signal
-# a mandatory-hardware failure at boot, so a failure is audible even when
-# the LCD itself is the thing that's down and can't show an error.
-HARDWARE_FAILURE_PATTERN = (
-    [(0.15, 0.15)] * 3 + [(0.5, 0.15)] * 3 + [(0.15, 0.15)] * 3
-)
-
 # 16x2 character LCD, direct-wired (no I2C backpack, 4-bit mode).
 # Pin numbers below are BOARD (physical) numbers, to match every other
 # piece of hardware in this project -- mfrc522 forces GPIO.setmode
-# (GPIO.BOARD) internally, and the buzzer uses BOARD too. RPi.GPIO only
+# (GPIO.BOARD) internally. RPi.GPIO only
 # allows ONE numbering mode per process, so everything has to agree.
-# RS, E, D6, D7 match the original wiring plan (BCM12/BOARD32,
-# BCM7/BOARD26, BCM24/BOARD18, BCM23/BOARD16). D4 and D5 were MOVED from
-# their original pins (BOARD24, BOARD22) to BOARD13 and BOARD15, because
-# 24 and 22 are already used by the RFID reader (SDA/CS and RST). If you
-# rewire the LCD to different physical pins, update the map below to match.
+# E deliberately uses BOARD 29 (GPIO5), not BOARD 26 (GPIO7/SPI CE1).
+# BOARD 26 is an SPI chip-select pin and can be claimed or driven by SPI
+# while the MFRC522 is active, causing intermittent LCD operation.
+# D4 and D5 must not use BOARD 24/22 because those pins belong to RFID.
 LCD_ENABLED = True
 LCD_PIN_RS = 32                   # BOARD 32 (BCM12)
-LCD_PIN_E = 26                    # BOARD 26 (BCM7)
+LCD_PIN_E = 29                    # BOARD 29 (BCM5), free of SPI functions
 LCD_PINS_DATA = [13, 15, 18, 16]  # D4, D5, D6, D7 (D4/D5 moved off RFID pins)
 LCD_COLS = 16
 LCD_ROWS = 2
@@ -173,34 +141,34 @@ signal.signal(signal.SIGTERM, _signal_handler)
 
 # --------------------------------------------------------------- database --
 
-DEFAULT_CONFIG = {
-    "AUTHORIZED_UID": None,
-    "user_mappings": {},       # slot(str) -> name(str)
-    "user_schedules": {},      # slot(str) -> {"start": "HH:MM", "end": "HH:MM"}
-                                # Applies to fingerprint users only. The
-                                # master RFID card is the sole admin and
-                                # is never subject to a schedule.
-    "lockout_state": {         # persists across restarts
-        "consecutive_failures": 0,
-        "lockout_count": 0,       # how many times lockout has triggered,
-                                   # drives the exponential backoff
-        "locked_until": 0,        # unix timestamp, 0 = not locked
-    },
-}
-config = dict(DEFAULT_CONFIG)
+def new_config():
+    """Return independent nested defaults for a new or recovered database."""
+    return {
+        "AUTHORIZED_UID": None,
+        "user_mappings": {},
+        "user_schedules": {},
+        "lockout_state": {
+            "consecutive_failures": 0,
+            "lockout_count": 0,
+            "locked_until": 0,
+        },
+    }
+
+
+config = new_config()
 
 
 def normalize_config():
     global config
     if not isinstance(config, dict):
-        config = dict(DEFAULT_CONFIG)
+        config = new_config()
     config.setdefault("AUTHORIZED_UID", None)
     if not isinstance(config.get("user_mappings"), dict):
         config["user_mappings"] = {}
     if not isinstance(config.get("user_schedules"), dict):
         config["user_schedules"] = {}
     if not isinstance(config.get("lockout_state"), dict):
-        config["lockout_state"] = dict(DEFAULT_CONFIG["lockout_state"])
+        config["lockout_state"] = new_config()["lockout_state"]
     else:
         config["lockout_state"].setdefault("consecutive_failures", 0)
         config["lockout_state"].setdefault("lockout_count", 0)
@@ -228,7 +196,7 @@ def load_database():
         except (json.JSONDecodeError, OSError) as e:
             log(f"Could not load {label}: {e}", "ERROR")
 
-    config = dict(DEFAULT_CONFIG)
+    config = new_config()
 
 
 def save_database():
@@ -297,6 +265,7 @@ def initialize_fingerprint():
         return True
     except (OSError, serial.SerialException, RuntimeError) as e:
         finger_sensor_online = False
+        finger = None
         log(f"Fingerprint init failed: {e}", "ERROR")
         return False
 
@@ -465,8 +434,7 @@ def initialize_rfid():
     log("Initializing RFID reader...")
     try:
         GPIO.setwarnings(False)
-        reader = SimpleMFRC522()  # internally calls GPIO.setmode(GPIO.BOARD);
-                                   # harmless no-op if buzzer already set it
+        reader = SimpleMFRC522()  # internally calls GPIO.setmode(GPIO.BOARD)
         rfid_online = True
         log("RFID reader online.")
         return True
@@ -489,137 +457,11 @@ def read_rfid_nonblocking():
         return None
 
 
-# ---------------------------------------------------------------- buzzer ---
-#
-# Drives the buzzer with software PWM instead of a plain on/off level.
-# This makes the SAME code work correctly whether the buzzer turns out to
-# be active (has its own oscillator; produces sound on any signal,
-# including PWM) or passive (needs a driven tone to make sound at all).
-# We never need to know in advance which kind is connected.
-
-buzzer_online = False
-_buzzer_lock = threading.Lock()
-_pwm = None
-
-
-def initialize_buzzer():
-    """Best-effort setup. The system is designed to work identically with
-    or without a buzzer attached, so any failure here just leaves
-    buzzer_online False and nothing else changes."""
-    global buzzer_online, _pwm
-    try:
-        # BOARD mode is shared with the RFID reader (mfrc522 sets this
-        # internally); setting it here first means whichever hardware
-        # initializes first "wins" the mode and the other reuses it.
-        GPIO.setmode(GPIO.BOARD)
-        GPIO.setwarnings(False)
-        GPIO.setup(BUZZER_PIN, GPIO.OUT)
-        GPIO.output(BUZZER_PIN, GPIO.LOW if BUZZER_ACTIVE_HIGH else GPIO.HIGH)
-        _pwm = GPIO.PWM(BUZZER_PIN, BUZZER_TONE_HZ)
-        buzzer_online = True
-        log(f"Buzzer initialized on pin {BUZZER_PIN} (PWM {BUZZER_TONE_HZ}Hz).")
-    except (OSError, RuntimeError, ValueError) as e:
-        buzzer_online = False
-        _pwm = None
-        log(f"Buzzer not available (will run without it): {e}", "WARNING")
-
-
-def _buzzer_on():
-    """Starts PWM. If PWM setup ever fails at runtime (not just at init),
-    falls back to a plain digital HIGH so an active buzzer still works
-    even if something's wrong with the PWM channel."""
-    try:
-        _pwm.start(50)  # 50% duty cycle square wave
-        return True
-    except (OSError, RuntimeError, AttributeError) as e:
-        log(f"Buzzer PWM start failed, falling back to plain output: {e}", "WARNING")
-        try:
-            GPIO.output(BUZZER_PIN, GPIO.HIGH if BUZZER_ACTIVE_HIGH else GPIO.LOW)
-            return True
-        except (OSError, RuntimeError) as e2:
-            log(f"Buzzer GPIO write failed: {e2}", "WARNING")
-            return False
-
-
-def _buzzer_off():
-    try:
-        _pwm.stop()
-    except (OSError, RuntimeError, AttributeError):
-        pass
-    try:
-        GPIO.output(BUZZER_PIN, GPIO.LOW if BUZZER_ACTIVE_HIGH else GPIO.HIGH)
-    except (OSError, RuntimeError):
-        pass
-
-
-def _buzz(duration, pattern=None):
-    """Runs in a background thread so it never blocks scanning.
-    pattern, if given, is a list of (on_seconds, off_seconds) pairs and
-    duration is ignored; otherwise buzzes solid for `duration` seconds.
-    Silently does nothing if the buzzer isn't available."""
-    if not buzzer_online:
-        return
-
-    def worker():
-        with _buzzer_lock:
-            try:
-                if pattern:
-                    for on_s, off_s in pattern:
-                        if not _buzzer_on():
-                            return
-                        time.sleep(on_s)
-                        _buzzer_off()
-                        time.sleep(off_s)
-                else:
-                    if _buzzer_on():
-                        time.sleep(duration)
-            finally:
-                _buzzer_off()
-
-    threading.Thread(target=worker, daemon=True).start()
-
-
-def buzz_granted():
-    """Single short buzz on access granted."""
-    _buzz(GRANTED_BUZZ_SECONDS)
-
-
-def buzz_denied():
-    """Long buzz (default 5s) on access denied."""
-    _buzz(DENIED_BUZZ_SECONDS)
-
-
-def test_buzzer():
-    """Used by the status/menu check. Returns True if a buzz was attempted."""
-    if not buzzer_online:
-        return False
-    _buzz(0.3)
-    return True
-
-
-def buzz_hardware_failure():
-    """Distinct alert pattern used ONLY when mandatory hardware is missing
-    at boot. Runs synchronously (not via the background-thread _buzz
-    helper) since it happens before the rest of the app is up, and we
-    want it to fully finish before deciding what to do next. Best-effort:
-    does nothing if the buzzer itself is the thing that's offline."""
-    if not buzzer_online:
-        return
-    with _buzzer_lock:
-        for on_s, off_s in HARDWARE_FAILURE_PATTERN:
-            if not _buzzer_on():
-                return
-            time.sleep(on_s)
-            _buzzer_off()
-            time.sleep(off_s)
-
-
 # ------------------------------------------------------------------ LCD ----
 #
 # 16x2 character LCD wired directly to GPIO (4-bit mode, no I2C backpack).
-# Same "fully optional, best-effort" pattern as the buzzer: any failure
-# here just leaves lcd_online False and the rest of the app runs
-# unchanged, printing to the terminal exactly as before.
+# A direct LCD with R/W tied to ground is write-only: initialization can
+# validate the Pi GPIO interface, not the presence or health of the panel.
 
 lcd_online = False
 lcd = None
@@ -632,9 +474,7 @@ def initialize_lcd():
         lcd_online = False
         return False
     try:
-        # BOARD mode is shared with the RFID reader and buzzer (mfrc522
-        # and initialize_buzzer() both set it); whichever runs first
-        # wins the mode and everyone else just reuses it.
+        # The MFRC522 uses BOARD numbering too, so explicitly retain it.
         GPIO.setmode(GPIO.BOARD)
         GPIO.setwarnings(False)
         lcd = CharLCD(
@@ -647,14 +487,14 @@ def initialize_lcd():
         )
         lcd.clear()
         lcd_online = True
-        log(f"LCD initialized ({LCD_COLS}x{LCD_ROWS}, BOARD pins "
+        log(f"LCD GPIO interface initialized ({LCD_COLS}x{LCD_ROWS}, BOARD pins "
             f"RS={LCD_PIN_RS} E={LCD_PIN_E} D4-D7={LCD_PINS_DATA}).")
         lcd_show("Access Control", "Ready")
         return True
     except (OSError, RuntimeError, ValueError) as e:
         lcd_online = False
         lcd = None
-        log(f"LCD not available (will run without it): {e}", "WARNING")
+        log(f"LCD GPIO interface unavailable (will run without display output): {e}", "WARNING")
         return False
 
 
@@ -669,16 +509,8 @@ def lcd_show(line1="", line2=""):
             lcd.write_string(line1[:LCD_COLS])
             lcd.cursor_pos = (1, 0)
             lcd.write_string(line2[:LCD_COLS])
-        except (OSError, RuntimeError) as e:
+        except (OSError, RuntimeError, ValueError) as e:
             log(f"LCD write failed: {e}", "WARNING")
-
-
-def test_lcd():
-    """Used by the status/menu check. Returns True if a message was shown."""
-    if not lcd_online:
-        return False
-    lcd_show("Hello!", "LCD Working :)")
-    return True
 
 
 # --------------------------------------------------------------- scanner ---
@@ -770,6 +602,12 @@ def scanner_mode():
     if config["AUTHORIZED_UID"] is None:
         print("No master RFID card is set. Use menu option 4 first.")
         return
+    if not rfid_online:
+        print("RFID reader is offline. Scanner mode needs the RFID reader.")
+        return
+    if not finger_sensor_online:
+        print("Fingerprint sensor is offline. Scanner mode needs the fingerprint sensor.")
+        return
 
     decay_lockout_backoff()
     lcd_show("Access Control", "Ready")
@@ -807,32 +645,26 @@ def scanner_mode():
                           f"allowed access hours ({schedule['start']}-{schedule['end']}).\n{'='*50}")
                     security_event("access_denied", reason="outside_schedule",
                                     user=name, slot=slot, schedule=schedule)
-                    buzz_denied()
                     lcd_show("ACCESS DENIED", "Outside hours")
                 else:
                     print(f"\n{'='*50}\nACCESS GRANTED\nWelcome, {name}! (slot #{slot})\n{'='*50}")
                     granted = True
-                    buzz_granted()
                     lcd_show("ACCESS GRANTED", name[:LCD_COLS])
             elif status == "NO_MATCH":
                 print(f"\n{'='*50}\nACCESS DENIED\nFingerprint verification failed.\n{'='*50}")
                 security_event("access_denied", reason="fingerprint_not_recognized")
-                buzz_denied()
                 lcd_show("ACCESS DENIED", "Finger no match")
             elif status == "COMMUNICATION_ERROR":
                 print("\nAUTHENTICATION UNAVAILABLE: fingerprint sensor comms failed.")
-                buzz_denied()
                 lcd_show("SENSOR ERROR", "Try again later")
             elif status == "SHUTDOWN":
                 break
             else:
                 print("\nFingerprint authentication timed out.")
-                buzz_denied()
                 lcd_show("ACCESS DENIED", "Finger timeout")
         else:
             print("RFID DENIED: Unknown card.")
             security_event("access_denied", reason="unknown_rfid", uid=uid)
-            buzz_denied()
             lcd_show("ACCESS DENIED", "Unknown card")
 
         if granted:
@@ -1057,6 +889,10 @@ def change_master_rfid():
     print("\n" + "=" * 50 + "\nCHANGE MASTER RFID CARD\n" + "=" * 50)
     print("WARNING: this card becomes the master authentication card.")
 
+    if not rfid_online:
+        print("RFID reader is offline.")
+        return
+
     if input("Type CHANGE to continue: ").strip() != "CHANGE":
         print("Operation canceled.")
         return
@@ -1121,30 +957,17 @@ def show_status():
         if count is not None:
             print(f"  Sensor templates: {count}")
 
-    print("\nBuzzer:")
-    print(f"  Status: {'ONLINE' if buzzer_online else 'OFFLINE (system runs fine without it)'}")
-    print(f"  Pin (BOARD): {BUZZER_PIN}  |  Drive: PWM square wave, {BUZZER_TONE_HZ}Hz")
-    print(f"  Granted buzz: {GRANTED_BUZZ_SECONDS}s | Denied buzz: {DENIED_BUZZ_SECONDS}s")
-    if buzzer_online:
-        if input("  Test buzzer now? (y/N): ").strip().lower() == "y":
-            if test_buzzer():
-                print("  Buzzing...")
-                time.sleep(0.3)
-            else:
-                print("  Test failed.")
-
     print("\nLCD:")
-    print(f"  Status: {'ONLINE' if lcd_online else 'OFFLINE (system runs fine without it)'}")
+    print(f"  GPIO interface: {'READY' if lcd_online else 'UNAVAILABLE'}")
     print(f"  Size: {LCD_COLS}x{LCD_ROWS}  |  Pins (BOARD): RS={LCD_PIN_RS} "
           f"E={LCD_PIN_E} D4-D7={LCD_PINS_DATA}")
+    print("  Note: a direct LCD with R/W tied to GND cannot report panel presence.")
     if lcd_online:
         if input("  Test LCD now? (y/N): ").strip().lower() == "y":
-            if test_lcd():
-                print("  Message sent to LCD.")
-                time.sleep(2)
-                lcd_show("Access Control", "Ready")
-            else:
-                print("  Test failed.")
+            lcd_show("Hello!", "LCD Working :)")
+            print("  Message sent to LCD.")
+            time.sleep(2)
+            lcd_show("Access Control", "Ready")
 
     print("\nStorage:")
     print(f"  Database: {DB_FILE} (exists: {os.path.exists(DB_FILE)})")
@@ -1241,14 +1064,10 @@ MENU_ACTIONS = {
     "6": show_recent_logs,
     "7": edit_user_schedule,
 }
-# Buzzer status/testing lives inside show_status() (option 5), per design —
-# there is no separate hardware-presence question asked anywhere.
-
-
 def main_menu():
     global shutdown_requested
     while not shutdown_requested:
-        print(f"\n{'='*50}\n RFID + FINGERPRINT ACCESS SYSTEM  (v{VERSION})\n{'='*50}")
+        print(f"\n{'='*50}\n RFID + FINGERPRINT ACCESS SYSTEM\n{'='*50}")
         print("1. Start Scanner Mode\n2. Enroll New Fingerprint\n3. Delete Fingerprint\n"
               "4. Change Master RFID Card\n5. Show System Status\n6. View Recent Security Logs\n"
               "7. Edit User Access Schedule\n8. Exit")
@@ -1284,11 +1103,6 @@ def cleanup():
     global uart
     print()
     log("Shutting down hardware...")
-    if buzzer_online:
-        try:
-            _buzzer_off()
-        except (OSError, RuntimeError):
-            pass
     if lcd_online and lcd is not None:
         try:
             lcd.clear()
@@ -1308,81 +1122,21 @@ def cleanup():
     log("Shutdown complete.")
 
 
-def require_all_hardware():
-    """Hard boot gate: this build treats RFID, fingerprint, buzzer, and LCD
-    as all mandatory. Retries indefinitely (every HARDWARE_RETRY_SECONDS)
-    until every one of them initializes successfully -- the app will not
-    enter the menu with any of them missing.
-
-    Init order matters: initialize_buzzer() must run before
-    initialize_rfid(), because SimpleMFRC522 forces GPIO.setmode
-    (GPIO.BOARD) internally, and both the buzzer and LCD also need BOARD
-    mode -- setting it via the buzzer first means every later GPIO user
-    just reuses the same mode instead of conflicting with it.
-
-    Special case: if the LCD is the only thing missing, there's no
-    display to show that on, so a distinct buzzer pattern
-    (buzz_hardware_failure) doubles as the failure signal whenever the
-    buzzer itself is up. If the buzzer is ALSO down, the terminal/log is
-    the only channel left, which was an accepted tradeoff (see prior
-    conversation) rather than an oversight.
-    """
-    attempt = 0
-    while True:
-        attempt += 1
-        initialize_fingerprint()
-        initialize_buzzer()
-        initialize_lcd()
-        initialize_rfid()
-
-        missing = []
-        if not rfid_online:
-            missing.append("RFID reader")
-        if not finger_sensor_online:
-            missing.append("Fingerprint sensor")
-        if not buzzer_online:
-            missing.append("Buzzer")
-        if not lcd_online:
-            missing.append("LCD")
-
-        if not missing:
-            log("All mandatory hardware online (RFID, fingerprint, buzzer, LCD).")
-            lcd_show("All Systems", "Online")
-            return
-
-        log(f"Attempt {attempt}: missing mandatory hardware: {', '.join(missing)}. "
-            f"Retrying in {HARDWARE_RETRY_SECONDS}s...", "ERROR")
-        # Show on whichever display channels are actually up right now.
-        lcd_show("HARDWARE ERROR", (", ".join(missing))[:LCD_COLS])
-        buzz_hardware_failure()
-
-        try:
-            time.sleep(HARDWARE_RETRY_SECONDS)
-        except KeyboardInterrupt:
-            raise
-
-
 def main():
-    print(f"\n{'='*50}\n RFID + FINGERPRINT ACCESS SYSTEM  (v{VERSION})\n{'='*50}")
+    print(f"\n{'='*50}\n RFID + FINGERPRINT ACCESS SYSTEM\n{'='*50}")
     try:
         load_database()
         decay_lockout_backoff()
 
-        if REQUIRE_ALL_HARDWARE:
-            require_all_hardware()
-        else:
-            initialize_fingerprint()
-            initialize_buzzer()
-            initialize_lcd()
-            initialize_rfid()
-            if not rfid_online:
-                log("RFID reader is offline.", "WARNING")
-            if not finger_sensor_online:
-                log("Fingerprint sensor is offline.", "WARNING")
-            if not buzzer_online:
-                log("Buzzer is offline (system will run without audio feedback).", "WARNING")
-            if not lcd_online:
-                log("LCD is offline (system will run without a display).", "WARNING")
+        initialize_fingerprint()
+        initialize_rfid()
+        initialize_lcd()
+        if not rfid_online:
+            log("RFID reader is unavailable; its menu actions will stay disabled.", "WARNING")
+        if not finger_sensor_online:
+            log("Fingerprint sensor is unavailable; its menu actions will stay disabled.", "WARNING")
+        if not lcd_online:
+            log("LCD GPIO interface is unavailable; system will run without display output.", "WARNING")
 
         if config["AUTHORIZED_UID"] is None:
             log("No master RFID card configured yet. Set one via the menu.", "WARNING")
