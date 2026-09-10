@@ -2,7 +2,7 @@
 #
 # Usage:
 #   chmod +x setup.sh        
-#   sudo ./setup.sh --auto  
+#   sudo ./setup.sh
 
 set +e  # keep checking even after individual failures
 
@@ -30,24 +30,25 @@ PROJECT_FILE="$SCRIPT_DIR/run.py"
 # ---- argument parsing ----------------------------------------------------
 #
 # Modes:
-#   (none)  report-only
-#   --auto  unattended: do every fix immediately, no prompts
+#   (none)     install/configure missing requirements automatically
+#   --check    report-only; do not change the system
 
-AUTO_MODE=0
+AUTO_MODE=1
 for arg in "$@"; do
     case "$arg" in
-        --auto) AUTO_MODE=1 ;;
+        --check) AUTO_MODE=0 ;;
+        --auto)  AUTO_MODE=1 ;; # Backward-compatible; default is already automatic.
         *)      warn "Unknown option '$arg' ignored." ;;
     esac
 done
 
 PIP_PACKAGES="pyserial RPi.GPIO mfrc522 adafruit-circuitpython-fingerprint RPLCD"
-APT_PACKAGES="python3-pip python3-dev python3-setuptools python3-venv i2c-tools"
+APT_PACKAGES="python3-pip python3-dev python3-setuptools python3-venv"
 REQUIRED_GROUPS="gpio spi dialout"
 
 # ---- figure out who the "real" (non-root) user is ------------------------
 #
-# This matters a lot when run via `sudo ./check_setup.sh --auto`: $USER and
+# This matters a lot when run via `sudo ./setup.sh`: $USER and
 # `whoami` would report "root" in that case, which is NOT who should be
 # added to the gpio/spi/dialout groups. SUDO_USER holds the original login
 # user when invoked through sudo, so we prefer that whenever it's set and
@@ -77,7 +78,7 @@ as_root() {
 }
 
 # Helper: run python3 as the real login user, not root. This matters
-# because `sudo ./check_setup.sh --auto` installs pip packages into the
+# because `sudo ./setup.sh` installs pip packages into the
 # real user's home directory (~/.local/lib/...), which root's own python3
 # cannot see. Every import check must run as that same user or it will
 # report a false FAIL right after a successful install.
@@ -90,8 +91,8 @@ run_as_real_user() {
 }
 
 # Decide whether to actually perform a fix action:
-#   --auto  -> always yes
-#   neither -> never (report-only)
+#   default -> always fix automatically
+#   --check -> never fix (report-only)
 should_fix() {
     [ "$AUTO_MODE" -eq 1 ]
 }
@@ -99,15 +100,15 @@ should_fix() {
 printf "${BOLD}=========================================================\n"
 printf " ACCESS CONTROL SYSTEM - SETUP CHECK\n"
 printf "=========================================================${RESET}\n"
-info "v3.0: RFID, fingerprint sensor, buzzer, and LCD are ALL required."
-info "main.py will refuse to start the menu until every one of them"
-info "initializes successfully - this check helps catch problems"
-info "with any of them before you try to run the app."
+info "Hardware is optional at startup; unavailable devices leave only their"
+info "related menu actions unavailable, so you can test with partial wiring."
+info "The direct-wired LCD is checked as a GPIO interface, but cannot be"
+info "electronically detected while its R/W pin is tied to ground."
 
 if [ "$AUTO_MODE" -eq 1 ]; then
-    info "Running in AUTO mode: missing pieces will be installed automatically."
+    info "Automatic setup enabled: missing pieces will be installed automatically."
     if [ "$RUNNING_AS_ROOT" -eq 0 ]; then
-        warn "Not running as root. --auto works best with: sudo ./check_setup.sh --auto"
+        warn "Not running as root. For system configuration, run: sudo ./setup.sh"
     fi
     info "Detected login user for group membership / permissions: $REAL_USER"
 fi
@@ -254,38 +255,27 @@ else
     warn "apt-get not found. This project targets Raspberry Pi OS (Debian-based); if you're on a different distro, install equivalent packages manually: $APT_PACKAGES"
 fi
 
-# ---- 3b. Remove PEP 668 EXTERNALLY-MANAGED marker -------------------------
-#
-# Recent Debian/Pi OS ship python3-pip with an EXTERNALLY-MANAGED marker
-# file that blocks plain `pip install` system-wide (PEP 668). We already
-# pass --break-system-packages to pip below, which is normally enough on
-# its own; removing the marker here too is a belt-and-suspenders step some
-# environments still need. Only done in --auto mode since it's a system
-# change, and made safe to re-run (glob may match nothing / multiple
-# python3.X dirs).
+# ---- 3b. Python package policy (PEP 668) ----------------------------------
 
+# Fresh Raspberry Pi OS installations can mark Python as externally managed,
+# which blocks the required pip installs. Remove the marker before installing
+# project dependencies; this is intentionally done only in automatic mode.
 section "Python Package Policy (PEP 668)"
 
-EXTERNALLY_MANAGED_FILES=(/usr/lib/python3*/EXTERNALLY-MANAGED)
-FOUND_MARKER=0
-for f in "${EXTERNALLY_MANAGED_FILES[@]}"; do
-    [ -e "$f" ] || continue
-    FOUND_MARKER=1
-    warn "Found PEP 668 marker: $f"
+PEP668_MARKERS=(/usr/lib/python3*/EXTERNALLY-MANAGED)
+for marker in "${PEP668_MARKERS[@]}"; do
+    [ -e "$marker" ] || continue
     if should_fix; then
-        as_root rm -f "$f"
+        as_root rm -f "$marker"
         if [ $? -eq 0 ]; then
-            ok "Removed $f"
+            ok "Removed PEP 668 marker: $marker"
         else
-            fail "Could not remove $f. Try manually: sudo rm $f"
+            fail "Could not remove PEP 668 marker: $marker"
         fi
     else
-        info "Skipped. Remove manually: sudo rm $f"
+        warn "PEP 668 marker found: $marker (run sudo ./setup.sh to remove it)"
     fi
 done
-if [ "$FOUND_MARKER" -eq 0 ]; then
-    ok "No EXTERNALLY-MANAGED marker found (pip installs unrestricted, or already removed)"
-fi
 
 # ---- 4. GPIO permissions --------------------------------------------------
 
@@ -341,14 +331,25 @@ else
     fail "python3 not found on PATH. Install it before continuing (e.g. sudo apt-get install -y python3)."
 fi
 
-if command -v pip3 >/dev/null 2>&1 || command -v pip >/dev/null 2>&1; then
-    ok "pip available"
+PIP_COMMAND=""
+if command -v pip3 >/dev/null 2>&1; then
+    PIP_COMMAND="pip3"
+elif command -v pip >/dev/null 2>&1; then
+    PIP_COMMAND="pip"
+fi
+
+if [ -n "$PIP_COMMAND" ]; then
+    ok "$PIP_COMMAND available"
 else
     warn "pip not found."
     if should_fix; then
         as_root apt-get update && as_root apt-get install -y python3-pip
-        if command -v pip3 >/dev/null 2>&1 || command -v pip >/dev/null 2>&1; then
-            ok "pip installed successfully"
+        if command -v pip3 >/dev/null 2>&1; then
+            PIP_COMMAND="pip3"
+            ok "$PIP_COMMAND installed successfully"
+        elif command -v pip >/dev/null 2>&1; then
+            PIP_COMMAND="pip"
+            ok "$PIP_COMMAND installed successfully"
         else
             fail "pip still not found after install attempt."
         fi
@@ -376,12 +377,12 @@ check_python_module "adafruit_fingerprint" "adafruit-circuitpython-fingerprint"
 check_python_module "RPLCD" "RPLCD"
 
 if [ "${#MISSING_PIP[@]}" -gt 0 ]; then
-    if should_fix; then
+    if should_fix && [ -n "$PIP_COMMAND" ]; then
         # Always install as the real login user, never as root, even when
         # this script itself is run via sudo. This keeps packages in that
         # user's own site-packages (~/.local/...), which is where their
-        # `python3 main.py` will actually look.
-        run_as_real_user pip install "${MISSING_PIP[@]}" --break-system-packages
+        # `python3 run.py` will actually look.
+        run_as_real_user "$PIP_COMMAND" install "${MISSING_PIP[@]}" --break-system-packages
         if [ $? -eq 0 ]; then
             ok "pip install command completed: ${MISSING_PIP[*]}"
             # Re-verify each module individually, as the same real user,
@@ -398,6 +399,8 @@ if [ "${#MISSING_PIP[@]}" -gt 0 ]; then
         else
             fail "pip install failed. Check the output above and try running it manually."
         fi
+    elif should_fix; then
+        fail "Cannot install Python modules because pip is unavailable."
     else
         info "Skipped. Install manually: pip install ${MISSING_PIP[*]} --break-system-packages"
     fi
@@ -418,7 +421,7 @@ if [ -f "$PROJECT_FILE" ]; then
     rm -f /tmp/pycompile_err.txt
     rm -rf "$SCRIPT_DIR/__pycache__" 2>/dev/null
 else
-    fail "Main script not found at $PROJECT_FILE (expected main.py alongside check_setup.sh)."
+    fail "Main script not found at $PROJECT_FILE (expected run.py alongside setup.sh)."
 fi
 
 PROJECT_DIR="$(dirname "$PROJECT_FILE")"
@@ -436,7 +439,7 @@ if [ -d "$LOGS_DIR" ]; then
         fail "Daily log directory exists but is NOT writable ($LOGS_DIR)."
     fi
 else
-    info "Daily log directory ($LOGS_DIR) doesn't exist yet - main.py creates it automatically on first run."
+    info "Daily log directory ($LOGS_DIR) doesn't exist yet - run.py creates it automatically on first run."
 fi
 
 # ---- 7. RFID reader probe (best-effort, non-invasive) ----------------------
@@ -489,45 +492,13 @@ else
     warn "Skipping UART probe (/dev/serial0 or pyserial not available)."
 fi
 
-# ---- 9. Buzzer (best-effort probe - optional hardware) ----------------------
-
-section "Buzzer (best-effort probe)"
-
-BUZZER_PIN_BOARD=12   # must match BUZZER_PIN in main.py (BOARD numbering)
-
-if run_as_real_user python3 -c "import RPi.GPIO" >/dev/null 2>&1; then
-    run_as_real_user python3 - <<PYEOF 2>/dev/null
-import sys
-try:
-    import RPi.GPIO as GPIO
-    GPIO.setwarnings(False)
-    GPIO.setmode(GPIO.BOARD)
-    GPIO.setup($BUZZER_PIN_BOARD, GPIO.OUT)
-    GPIO.output($BUZZER_PIN_BOARD, GPIO.LOW)
-    GPIO.cleanup($BUZZER_PIN_BOARD)
-    sys.exit(0)
-except Exception:
-    sys.exit(1)
-PYEOF
-    if [ $? -eq 0 ]; then
-        ok "GPIO pin $BUZZER_PIN_BOARD (BOARD) is free and claimable for the buzzer"
-        info "This confirms the pin is usable, not that a buzzer is physically connected."
-    else
-        warn "Could not claim GPIO pin $BUZZER_PIN_BOARD (BOARD) for the buzzer. It may be in use by another process/overlay, or wiring may be off. As of v3.0 this will block main.py from starting."
-    fi
-else
-    warn "RPi.GPIO not importable; cannot probe the buzzer pin. As of v3.0 this will block main.py from starting (the buzzer is now required)."
-fi
-info "As of v3.0, the buzzer is REQUIRED, not optional: main.py will refuse to start the menu until it initializes successfully (along with RFID, fingerprint, and LCD)."
-info "Check it live via the app's menu: option 5 (System Status) -> Buzzer section -> Test buzzer now?"
-
-# ---- 10. LCD (best-effort probe - optional hardware) ------------------------
+# ---- 9. LCD GPIO interface (best-effort probe) ------------------------------
 
 section "16x2 LCD (best-effort probe)"
 
-# Must match LCD_PIN_RS / LCD_PIN_E / LCD_PINS_DATA in main.py (BOARD numbering).
+# Must match LCD_PIN_RS / LCD_PIN_E / LCD_PINS_DATA in run.py (BOARD numbering).
 LCD_PIN_RS_BOARD=32
-LCD_PIN_E_BOARD=26
+LCD_PIN_E_BOARD=29
 LCD_PINS_DATA_BOARD="13 15 18 16"
 
 if run_as_real_user python3 -c "import RPi.GPIO, RPLCD" >/dev/null 2>&1; then
@@ -551,12 +522,12 @@ PYEOF
         ok "GPIO pins RS=$LCD_PIN_RS_BOARD E=$LCD_PIN_E_BOARD D4-D7=($LCD_PINS_DATA_BOARD) (BOARD) are free and claimable for the LCD"
         info "This confirms the pins are usable, not that an LCD is physically connected."
     else
-        warn "Could not claim one or more LCD GPIO pins. They may be in use by another process/overlay, or wiring may be off. As of v3.0 this will block main.py from starting."
+        warn "Could not claim one or more LCD GPIO pins. They may be in use by another process/overlay, or wiring may be off."
     fi
 else
-    warn "RPi.GPIO or RPLCD not importable; cannot probe the LCD pins. As of v3.0 this will block main.py from starting (the LCD is now required)."
+    warn "RPi.GPIO or RPLCD not importable; cannot probe the LCD GPIO interface."
 fi
-info "As of v3.0, the LCD is REQUIRED, not optional: main.py will refuse to start the menu until it initializes successfully (along with RFID, fingerprint, and buzzer)."
+info "This proves the Pi GPIO interface, not the LCD panel itself: a direct LCD with R/W grounded has no feedback path."
 info "Check it live via the app's menu: option 5 (System Status) -> LCD section -> Test LCD now?"
 
 # ---- Summary ----------------------------------------------------------------
@@ -571,10 +542,10 @@ fi
 
 if [ "$FAIL" -gt 0 ]; then
     printf "\n${RED}${BOLD}Setup is NOT ready.${RESET} "
-    if [ "$AUTO_MODE" -eq 0 ]; then
-        printf "Fix the [FAIL] items above, or re-run with 'sudo ./check_setup.sh --auto' to fix them automatically.\n"
-    else
+    if [ "$AUTO_MODE" -eq 1 ]; then
         printf "Some items above still need manual attention (see messages above).\n"
+    else
+        printf "Re-run with 'sudo ./setup.sh' to apply available automatic fixes.\n"
     fi
     exit 1
 elif [ "$WARN" -gt 0 ]; then
